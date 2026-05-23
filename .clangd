@@ -1,0 +1,5 @@
+CompileFlags:
+  Add: [-std=c++23, -Wall, -Wextra]
+  # Point clangd at the CMake-generated compile commands so it uses
+  # the exact flags the compiler sees (include paths, defines, etc.).
+  CompilationDatabase: build
