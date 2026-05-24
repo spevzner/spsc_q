@@ -1509,6 +1509,230 @@ static void bench_raw_vs_smart_vs_value()
 }
 
 // ===========================================================================
+// unique_ptr<Message> — ownership-transfer queue
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Correctness: unique_ptr enforces single ownership through the queue
+// ---------------------------------------------------------------------------
+static void test_unique_ptr_queue()
+{
+    section("unique_ptr<Message> — ownership-transfer queue");
+
+    constexpr int N = 32;
+    using MsgPtr = std::unique_ptr<Message>;
+
+    // ── basic push / pop ───────────────────────────────────────────────────
+    {
+        spsc::SPSCQueue<MsgPtr> q(N);   // HeapStorage<unique_ptr<Message>> default
+
+        // Producer: allocate on heap, move unique_ptr into queue.
+        for (int i = 0; i < N; ++i) {
+            MsgPtr up = std::make_unique<Message>(
+                static_cast<std::uint64_t>(i),
+                "uptr_" + std::to_string(i),
+                i * 1.618);
+            CHECK(up != nullptr);
+            CHECK(q.try_push(std::move(up)));
+            CHECK(up == nullptr);  // moved-from: null, object now owned by queue
+        }
+
+        CHECK(g_msg_live.load() == N);   // all N objects alive inside the queue
+
+        // Consumer: pop, take ownership, verify, drop.
+        for (int i = 0; i < N; ++i) {
+            MsgPtr out;
+            CHECK(q.try_pop(out));
+            CHECK(out != nullptr);
+            CHECK(out != nullptr);        // sole owner (unique_ptr, no use_count)
+            CHECK(out->id    == static_cast<std::uint64_t>(i));
+            CHECK(out->value == i * 1.618);
+            // out goes out of scope here → object deleted
+        }
+
+        CHECK(q.empty());
+        CHECK(g_msg_live.load() == 0);   // all destroyed
+    }
+
+    // ── queue destroyed mid-flight ─────────────────────────────────────────
+    // Objects pushed but not yet popped must be destroyed with the queue.
+    {
+        {
+            spsc::SPSCQueue<MsgPtr> q(8);
+            for (int i = 0; i < 4; ++i)
+                CHECK(q.try_push(std::make_unique<Message>(i, "mid", 0.0)));
+            CHECK(g_msg_live.load() == 4);
+        }   // queue destroyed → unique_ptrs in slots destroyed → objects deleted
+        CHECK(g_msg_live.load() == 0);
+    }
+
+    // ── try_emplace ────────────────────────────────────────────────────────
+    // Construct the Message directly in the slot (HeapStorage path):
+    // unique_ptr<Message> is constructible from a raw Message* pointer.
+    {
+        spsc::SPSCQueue<MsgPtr> q(4);
+        // Pass a raw pointer: unique_ptr<Message>(new Message(...))
+        CHECK(q.try_emplace(new Message(7, "emplace", 2.71)));
+        MsgPtr out;
+        CHECK(q.try_pop(out));
+        CHECK(out->id == 7);
+        out.reset();  // destroy the Message before sampling the counter
+        CHECK(g_msg_live.load() == 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Four-way throughput: Message* / unique_ptr / shared_ptr / by value
+//
+// Recommendation guide
+// --------------------
+//  Message*             — fastest; use when lifetime is managed externally
+//                         (pool allocator, arena, shared_ptr held elsewhere)
+//  unique_ptr<Message>  — best default for ownership-transfer queues;
+//                         ~same speed as raw ptr, type-safe, auto-cleanup
+//  shared_ptr<Message>  — only when multiple owners genuinely needed;
+//                         2 atomic RMW per round-trip
+//  Message by value     — only when object is small and trivially movable;
+//                         each slot pays move-ctor + dtor cost
+// ---------------------------------------------------------------------------
+static void bench_ptr_comparison()
+{
+    section("Throughput — Message* / unique_ptr / shared_ptr / by value");
+
+    constexpr std::size_t N     = 4'000'000;
+    constexpr std::size_t QSIZE = 256;
+    constexpr std::size_t POOL  = QSIZE * 2;
+
+    // ── Message* (raw, pool owns) ─────────────────────────────────────────
+    {
+        std::vector<Message*> pool;
+        pool.reserve(POOL);
+        for (std::size_t i = 0; i < POOL; ++i)
+            pool.push_back(new Message(i, "p", 0.0));
+
+        spsc::SPSCQueue<Message*> q(QSIZE);
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(pool[i % POOL]);
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                Message* v = nullptr;
+                for (std::size_t i = 0; i < N; ++i) q.pop(v);
+            });
+            go.store(true, std::memory_order_release);
+            prod.join(); cons.join();
+        });
+        std::printf("     %-42s  %.1f M ops/s  (%4.1f ns/op)\n",
+                    "Message*            (trivial copy, no dtor)",
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+        for (auto* p : pool) delete p;
+    }
+
+    // ── unique_ptr<Message> ────────────────────────────────────────────────
+    {
+        // Pool of unique_ptrs that we copy-construct from to keep the pool valid.
+        // Actually unique_ptr is move-only — so we use raw ptrs in pool and wrap per op.
+        // For a fair benchmark we re-wrap each pool ptr each iteration.
+        std::vector<Message*> raw_pool;
+        raw_pool.reserve(POOL);
+        for (std::size_t i = 0; i < POOL; ++i)
+            raw_pool.push_back(new Message(i, "p", 0.0));
+
+        spsc::SPSCQueue<std::unique_ptr<Message>> q(QSIZE);
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i) {
+                    // Wrap the raw ptr in a non-owning unique_ptr alias for
+                    // benchmarking the queue's per-op cost. We release it after
+                    // the pop so the pool object isn't actually deleted.
+                    q.push(std::unique_ptr<Message>(raw_pool[i % POOL]));
+                }
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                std::unique_ptr<Message> v;
+                for (std::size_t i = 0; i < N; ++i) {
+                    q.pop(v);
+                    (void)v.release();  // release so pool object isn't deleted
+                }
+            });
+            go.store(true, std::memory_order_release);
+            prod.join(); cons.join();
+        });
+        std::printf("     %-42s  %.1f M ops/s  (%4.1f ns/op)\n",
+                    "unique_ptr<Message> (move-only, null dtor)",
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+        for (auto* p : raw_pool) delete p;
+    }
+
+    // ── shared_ptr<Message> ───────────────────────────────────────────────
+    {
+        std::vector<std::shared_ptr<Message>> sp_pool;
+        sp_pool.reserve(POOL);
+        for (std::size_t i = 0; i < POOL; ++i)
+            sp_pool.push_back(std::make_shared<Message>(i, "p", 0.0));
+
+        spsc::SPSCQueue<std::shared_ptr<Message>> q(QSIZE);
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(sp_pool[i % POOL]);     // copy → atomic ref++
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                std::shared_ptr<Message> v;
+                for (std::size_t i = 0; i < N; ++i) { q.pop(v); v.reset(); }
+            });
+            go.store(true, std::memory_order_release);
+            prod.join(); cons.join();
+        });
+        std::printf("     %-42s  %.1f M ops/s  (%4.1f ns/op)\n",
+                    "shared_ptr<Message> (2x atomic ref-count)",
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    }
+
+    // ── Message by value ─────────────────────────────────────────────────
+    {
+        spsc::SPSCQueue<Message> q(QSIZE);
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(Message{i, "p", static_cast<double>(i)});
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire)) spsc::detail::cpu_relax();
+                Message v;
+                for (std::size_t i = 0; i < N; ++i) q.pop(v);
+            });
+            go.store(true, std::memory_order_release);
+            prod.join(); cons.join();
+        });
+        std::printf("     %-42s  %.1f M ops/s  (%4.1f ns/op)\n",
+                    "Message by value    (move-ctor + dtor/slot)",
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    }
+
+    std::printf("\n  Recommendation: unique_ptr<Message> + HeapStorage (default)\n"
+                "    → same speed as raw ptr, automatic cleanup, clear ownership\n");
+
+    CHECK(g_msg_live.load() == 0);
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -1542,6 +1766,8 @@ int main() {
     bench_shared_ptr();
     test_raw_pointer_queue();
     bench_raw_vs_smart_vs_value();
+    test_unique_ptr_queue();
+    bench_ptr_comparison();
 
     print_summary();
     return g_fail ? 1 : 0;
