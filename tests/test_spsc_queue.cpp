@@ -107,6 +107,45 @@ struct Counted {
     int value;
 };
 
+// ---------------------------------------------------------------------------
+// Complex object — non-trivial ctor/dtor, std::string member
+// ---------------------------------------------------------------------------
+
+// Lifetime counters let us verify that every constructed object is
+// destroyed exactly once, regardless of storage backend.
+std::atomic<int> g_msg_live{0};  // net live count (ctor - dtor)
+
+struct Message {
+    std::uint64_t id{};
+    std::string   text;    // non-trivial; may allocate on heap (long strings)
+    double        value{};
+
+    Message()
+        : id(0), value(0.0) { ++g_msg_live; }
+
+    Message(std::uint64_t i, std::string t, double v)
+        : id(i), text(std::move(t)), value(v) { ++g_msg_live; }
+
+    Message(const Message& o)
+        : id(o.id), text(o.text), value(o.value) { ++g_msg_live; }
+
+    Message(Message&& o) noexcept
+        : id(o.id), text(std::move(o.text)), value(o.value) { ++g_msg_live; }
+
+    Message& operator=(Message&& o) noexcept {
+        id = o.id; text = std::move(o.text); value = o.value; return *this;
+    }
+    Message& operator=(const Message& o) {
+        id = o.id; text = o.text; value = o.value; return *this;
+    }
+
+    ~Message() { --g_msg_live; }
+
+    bool operator==(const Message& o) const noexcept {
+        return id == o.id && text == o.text && value == o.value;
+    }
+};
+
 }  // anonymous namespace
 
 // ===========================================================================
@@ -718,6 +757,223 @@ static void bench_storage_backends() {
 }
 
 // ===========================================================================
+// Complex object tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Helper: exercise one ring buffer with N Message push/pops.
+// Returns the net g_msg_live delta so callers can assert no leaks.
+// ---------------------------------------------------------------------------
+template <typename RB>
+static int run_complex(RB& rb, std::size_t n,
+                       bool sso,   // true = short string (SSO); false = long (heap)
+                       const char* label)
+{
+    const int before = g_msg_live.load();
+
+    auto make = [&](std::size_t i) -> Message {
+        std::string text = sso
+            ? ("m" + std::to_string(i))                        // ≤4 chars, SSO
+            : ("long_instrument_name_" + std::to_string(i));   // >15 chars, heap
+        return Message{i, std::move(text), static_cast<double>(i) * 2.71828};
+    };
+
+    for (std::size_t i = 0; i < n; ++i)
+        CHECK(rb.try_push(make(i)));
+
+    {   // inner scope: `out` is destroyed before `after` is sampled so it
+        // doesn't contribute +1 to the live delta
+        Message out;
+        for (std::size_t i = 0; i < n; ++i) {
+            CHECK(rb.try_pop(out));
+            CHECK(out.id    == i);
+            CHECK(out.value == static_cast<double>(i) * 2.71828);
+            CHECK(!out.text.empty());
+        }
+        CHECK(rb.empty());
+    }   // `out` destroyed here
+
+    // For raw storages:  all pushed elements have been destroy_at'd → 0 extra live.
+    // For ArrayStorage:  N moved-from slots are still alive in arr_ (they were
+    //                    already counted in `before`; none were extra-created here).
+    const int after = g_msg_live.load();
+    std::printf("     %-42s  live delta = %+d\n", label, after - before);
+    return after - before;
+}
+
+// ---------------------------------------------------------------------------
+// Correctness: all four backends, SSO + heap strings
+// ---------------------------------------------------------------------------
+static void test_complex_object_all_backends() {
+    section("Complex object (Message) — correctness, all storage backends");
+
+    constexpr std::size_t N = 64;
+
+    // --- HeapStorage (raw, placement new) ---
+    {
+        spsc::SPSCRingBuffer<Message> rb(N);
+        int delta = run_complex(rb, N, /*sso=*/true,  "HeapStorage  / SSO  string");
+        CHECK(delta == 0);   // all elements destroyed after pop + queue dtor
+    }
+    {
+        spsc::SPSCRingBuffer<Message> rb(N);
+        int delta = run_complex(rb, N, /*sso=*/false, "HeapStorage  / heap string");
+        CHECK(delta == 0);
+    }
+
+    // --- InlineStorage (raw, placement new) ---
+    {
+        spsc::SPSCRingBuffer<Message, spsc::InlineStorage<Message, 64>> rb;
+        int delta = run_complex(rb, N, /*sso=*/true,  "InlineStorage/ SSO  string");
+        CHECK(delta == 0);
+    }
+    {
+        spsc::SPSCRingBuffer<Message, spsc::InlineStorage<Message, 64>> rb;
+        int delta = run_complex(rb, N, /*sso=*/false, "InlineStorage/ heap string");
+        CHECK(delta == 0);
+    }
+
+    // --- VectorStorage (raw, placement new) ---
+    {
+        spsc::SPSCRingBuffer<Message, spsc::VectorStorage<Message>> rb(N);
+        int delta = run_complex(rb, N, /*sso=*/true,  "VectorStorage/ SSO  string");
+        CHECK(delta == 0);
+    }
+    {
+        spsc::SPSCRingBuffer<Message, spsc::VectorStorage<Message>> rb(N);
+        int delta = run_complex(rb, N, /*sso=*/false, "VectorStorage/ heap string");
+        CHECK(delta == 0);
+    }
+
+    // --- ArrayStorage (live slots, assignment) ---
+    // After each pop the slot is in a moved-from state (valid but empty).
+    // The N default-constructed Message objects are counted from construction
+    // and are destroyed when the ring buffer itself is destroyed — not per pop.
+    {
+        spsc::SPSCRingBuffer<Message, spsc::ArrayStorage<Message, 64>> rb;
+        int delta = run_complex(rb, N, /*sso=*/true,  "ArrayStorage / SSO  string");
+        // delta == 0 once rb goes out of scope (destructor runs here)
+        CHECK(delta == 0);
+    }
+    {
+        spsc::SPSCRingBuffer<Message, spsc::ArrayStorage<Message, 64>> rb;
+        int delta = run_complex(rb, N, /*sso=*/false, "ArrayStorage / heap string");
+        CHECK(delta == 0);
+    }
+
+    // Global live count must be zero — no leaks from any backend.
+    CHECK(g_msg_live.load() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Throughput: complex object across all backends — SSO and heap string paths
+// ---------------------------------------------------------------------------
+static void bench_complex_object() {
+    section("Throughput — complex object (Message with std::string)");
+
+    constexpr std::size_t N     = 2'000'000;
+    constexpr std::size_t QSIZE = 256;
+
+    auto run_bench = [&](auto& q, const char* label) {
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&] {
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(Message{i, "sym", static_cast<double>(i)});
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                Message v;
+                for (std::size_t i = 0; i < N; ++i)
+                    q.pop(v);
+            });
+            go.store(true, std::memory_order_release);
+            prod.join();
+            cons.join();
+        });
+        std::printf("     %-42s  %.1f M ops/s  (%.1f ns/op)\n",
+                    label,
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    };
+
+    std::printf("  [ SSO string: \"sym\" — no heap alloc per element ]\n");
+    {
+        spsc::SPSCQueue<Message> q(QSIZE);
+        run_bench(q, "HeapStorage  (raw)");
+    }
+    {
+        spsc::SPSCQueue<Message,
+            spsc::SPSCRingBuffer<Message, spsc::InlineStorage<Message, 256>>> q;
+        run_bench(q, "InlineStorage<256> (raw)");
+    }
+    {
+        spsc::SPSCQueue<Message,
+            spsc::SPSCRingBuffer<Message, spsc::VectorStorage<Message>>> q(QSIZE);
+        run_bench(q, "VectorStorage (raw)");
+    }
+    {
+        spsc::SPSCQueue<Message,
+            spsc::SPSCRingBuffer<Message, spsc::ArrayStorage<Message, 256>>> q;
+        run_bench(q, "ArrayStorage<256>  (live, assign)");
+    }
+
+    std::printf("  [ Long string: 28 chars — heap alloc per element ]\n");
+    auto long_str = [](std::size_t i) {
+        return "long_instrument_name_" + std::to_string(i % 1000);
+    };
+
+    auto run_long = [&](auto& q, const char* label) {
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&] {
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(Message{i, long_str(i), static_cast<double>(i)});
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                Message v;
+                for (std::size_t i = 0; i < N; ++i)
+                    q.pop(v);
+            });
+            go.store(true, std::memory_order_release);
+            prod.join();
+            cons.join();
+        });
+        std::printf("     %-42s  %.1f M ops/s  (%.1f ns/op)\n",
+                    label,
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    };
+
+    {
+        spsc::SPSCQueue<Message> q(QSIZE);
+        run_long(q, "HeapStorage  (raw)");
+    }
+    {
+        spsc::SPSCQueue<Message,
+            spsc::SPSCRingBuffer<Message, spsc::InlineStorage<Message, 256>>> q;
+        run_long(q, "InlineStorage<256> (raw)");
+    }
+    {
+        spsc::SPSCQueue<Message,
+            spsc::SPSCRingBuffer<Message, spsc::VectorStorage<Message>>> q(QSIZE);
+        run_long(q, "VectorStorage (raw)");
+    }
+    {
+        spsc::SPSCQueue<Message,
+            spsc::SPSCRingBuffer<Message, spsc::ArrayStorage<Message, 256>>> q;
+        run_long(q, "ArrayStorage<256>  (live, assign)");
+    }
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -744,6 +1000,8 @@ int main() {
     test_vector_storage();
     test_array_storage();
     bench_storage_backends();
+    test_complex_object_all_backends();
+    bench_complex_object();
 
     print_summary();
     return g_fail ? 1 : 0;
