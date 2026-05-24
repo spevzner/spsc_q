@@ -146,6 +146,31 @@ struct Message {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Heap-allocated complex object accessed through shared_ptr
+// ---------------------------------------------------------------------------
+
+// Tracks live heap objects (NOT shared_ptr instances — the pointed-to values).
+std::atomic<int> g_heap_obj_live{0};
+
+struct HeapObject {
+    int         id{};
+    std::string name;
+    double      payload{};
+
+    HeapObject(int i, std::string n, double p)
+        : id(i), name(std::move(n)), payload(p)
+    { ++g_heap_obj_live; }
+
+    // Non-copyable: shared ownership is the only supported model.
+    HeapObject(const HeapObject&)            = delete;
+    HeapObject& operator=(const HeapObject&) = delete;
+
+    ~HeapObject() { --g_heap_obj_live; }
+};
+
+using HeapObjPtr = std::shared_ptr<HeapObject>;
+
 }  // anonymous namespace
 
 // ===========================================================================
@@ -974,6 +999,257 @@ static void bench_complex_object() {
 }
 
 // ===========================================================================
+// shared_ptr<HeapObject> tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Helper: run one storage backend through N shared_ptr push/pop cycles.
+//
+// Push via MOVE so ownership is fully transferred into the queue on each push
+// and fully transferred out on each pop.  After every pop the caller holds
+// the only reference (use_count == 1) and the underlying object is alive.
+// ---------------------------------------------------------------------------
+template <typename RB>
+static void run_shared_ptr(RB& rb, std::size_t n, const char* label)
+{
+    // ── pre-condition ──────────────────────────────────────────────────────
+    CHECK(g_heap_obj_live.load() == 0);
+
+    // ── push phase ─────────────────────────────────────────────────────────
+    // Allocate N heap objects and move their shared_ptrs into the queue.
+    // After each push the local handle is null and use_count inside the
+    // queue is exactly 1.
+    for (std::size_t i = 0; i < n; ++i) {
+        HeapObjPtr sp = std::make_shared<HeapObject>(
+            static_cast<int>(i),
+            "obj_" + std::to_string(i),
+            static_cast<double>(i) * 1.41421);
+
+        CHECK(sp.use_count() == 1);
+        CHECK(g_heap_obj_live.load() == static_cast<int>(i + 1));
+
+        CHECK(rb.try_push(std::move(sp)));
+
+        // sp was moved-from: it must now be null
+        CHECK(sp == nullptr);
+    }
+
+    // All N objects are alive, each owned by exactly one slot in the queue.
+    CHECK(g_heap_obj_live.load() == static_cast<int>(n));
+
+    // ── pop phase ──────────────────────────────────────────────────────────
+    for (std::size_t i = 0; i < n; ++i) {
+        HeapObjPtr out;
+        CHECK(rb.try_pop(out));
+
+        // Sole owner after pop; object still alive
+        CHECK(out != nullptr);
+        CHECK(out.use_count() == 1);
+        CHECK(out->id      == static_cast<int>(i));
+        CHECK(!out->name.empty());
+
+        // Drop the reference — object must be destroyed immediately
+        out.reset();
+        CHECK(g_heap_obj_live.load() == static_cast<int>(n - i - 1));
+    }
+
+    // ── post-condition ─────────────────────────────────────────────────────
+    CHECK(rb.empty());
+    CHECK(g_heap_obj_live.load() == 0);
+
+    std::printf("     %-35s  OK\n", label);
+}
+
+// ---------------------------------------------------------------------------
+// Shared-ownership test: push a COPY of the shared_ptr (use_count grows)
+// and verify the original caller still shares ownership during transit.
+// ---------------------------------------------------------------------------
+template <typename RB>
+static void run_shared_ptr_copy(RB& rb, const char* label)
+{
+    CHECK(g_heap_obj_live.load() == 0);
+
+    HeapObjPtr owner = std::make_shared<HeapObject>(99, "shared_obj", 3.14);
+    CHECK(owner.use_count() == 1);
+    CHECK(g_heap_obj_live.load() == 1);
+
+    // Copy-push: both owner and the queue slot hold a reference.
+    CHECK(rb.try_push(owner));  // lvalue → copy
+    CHECK(owner.use_count() == 2);
+    CHECK(g_heap_obj_live.load() == 1);  // still one object
+
+    HeapObjPtr out;
+    CHECK(rb.try_pop(out));
+    CHECK(out.use_count() == 2);    // owner + out both reference the object
+    CHECK(out.get() == owner.get()); // same underlying object
+    CHECK(g_heap_obj_live.load() == 1);
+
+    out.reset();   // drop one ref → use_count back to 1
+    CHECK(owner.use_count() == 1);
+    CHECK(g_heap_obj_live.load() == 1);
+
+    owner.reset(); // drop last ref → object destroyed
+    CHECK(g_heap_obj_live.load() == 0);
+
+    std::printf("     %-35s  OK\n", label);
+}
+
+// ---------------------------------------------------------------------------
+// Correctness: all four backends
+// ---------------------------------------------------------------------------
+static void test_shared_ptr_all_backends()
+{
+    section("shared_ptr<HeapObject> — all storage backends");
+
+    constexpr std::size_t N = 32;
+
+    std::printf("   [move-push: sole ownership through queue]\n");
+    {
+        spsc::SPSCRingBuffer<HeapObjPtr> rb(N);
+        run_shared_ptr(rb, N, "HeapStorage  (raw)");
+    }
+    {
+        spsc::SPSCRingBuffer<HeapObjPtr, spsc::InlineStorage<HeapObjPtr, 32>> rb;
+        run_shared_ptr(rb, N, "InlineStorage<32> (raw)");
+    }
+    {
+        spsc::SPSCRingBuffer<HeapObjPtr, spsc::VectorStorage<HeapObjPtr>> rb(N);
+        run_shared_ptr(rb, N, "VectorStorage (raw)");
+    }
+    {
+        // ArrayStorage: N default-constructed (null) shared_ptrs pre-built.
+        // Push = move-assign (slot takes ownership, source becomes null).
+        // Pop  = move-assign (caller takes ownership, slot becomes null again).
+        spsc::SPSCRingBuffer<HeapObjPtr, spsc::ArrayStorage<HeapObjPtr, 32>> rb;
+        run_shared_ptr(rb, N, "ArrayStorage<32>  (live, null)");
+    }
+
+    std::printf("   [copy-push: shared ownership during transit]\n");
+    {
+        spsc::SPSCRingBuffer<HeapObjPtr> rb(4);
+        run_shared_ptr_copy(rb, "HeapStorage  (raw)");
+    }
+    {
+        spsc::SPSCRingBuffer<HeapObjPtr, spsc::ArrayStorage<HeapObjPtr, 4>> rb;
+        run_shared_ptr_copy(rb, "ArrayStorage<4>   (live, null)");
+    }
+
+    // Absolute sanity: no HeapObject leaked across the entire section.
+    CHECK(g_heap_obj_live.load() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Correctness: queue destroyed mid-flight (shared_ptr keeps object alive)
+// ---------------------------------------------------------------------------
+static void test_shared_ptr_queue_destroyed_mid_flight()
+{
+    section("shared_ptr — object survives queue destruction");
+
+    CHECK(g_heap_obj_live.load() == 0);
+
+    // Declare alias OUTSIDE the block so it outlives the queue.
+    HeapObjPtr alias;
+
+    {   // Queue is destroyed before we pop — shared_ptr must keep object alive.
+        spsc::SPSCRingBuffer<HeapObjPtr> rb(4);
+
+        // Object 1: no external reference — will be destroyed with the queue.
+        HeapObjPtr sp = std::make_shared<HeapObject>(1, "no_ref", 0.0);
+        CHECK(rb.try_push(std::move(sp)));
+        CHECK(g_heap_obj_live.load() == 1);
+
+        // Object 2: alias holds a ref outside the block — must survive queue destruction.
+        HeapObjPtr keeper = std::make_shared<HeapObject>(2, "keeper", 0.0);
+        alias = keeper;                          // alias shares ownership
+        CHECK(rb.try_push(std::move(keeper)));   // queue slot takes the other ref
+        CHECK(alias.use_count() == 2);           // alias + queue slot
+        CHECK(g_heap_obj_live.load() == 2);
+    }   // rb destroyed: both slot shared_ptrs released
+        //   object 1 (no external ref)  → destroyed immediately
+        //   object 2 (alias still live) → ref count drops to 1, object survives
+
+    CHECK(g_heap_obj_live.load() == 1);  // only "keeper" survives via alias
+    CHECK(alias.use_count() == 1);
+    alias.reset();                       // drop last ref → destroyed
+    CHECK(g_heap_obj_live.load() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Throughput benchmark: shared_ptr<HeapObject>
+// ---------------------------------------------------------------------------
+static void bench_shared_ptr()
+{
+    section("Throughput — shared_ptr<HeapObject> (move through queue)");
+
+    constexpr std::size_t N     = 2'000'000;
+    constexpr std::size_t QSIZE = 256;
+
+    // Pre-allocate a pool of HeapObjects to avoid counting the make_shared
+    // allocation in the hot loop timing.  Producer refills from the pool
+    // (index mod pool size) so objects are reused.
+    constexpr std::size_t POOL = QSIZE * 2;
+    std::vector<HeapObjPtr> pool;
+    pool.reserve(POOL);
+    for (std::size_t i = 0; i < POOL; ++i)
+        pool.push_back(std::make_shared<HeapObject>(
+            static_cast<int>(i), "p", 0.0));
+
+    auto run = [&](auto& q, const char* label) {
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i) {
+                    // Copy-push (keeps pool valid for next round)
+                    q.push(pool[i % POOL]);
+                }
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                HeapObjPtr v;
+                for (std::size_t i = 0; i < N; ++i)
+                    q.pop(v);
+                // v holds last element; reset to not skew live count
+                v.reset();
+            });
+            go.store(true, std::memory_order_release);
+            prod.join();
+            cons.join();
+        });
+        std::printf("     %-35s  %.1f M ops/s  (%.1f ns/op)\n",
+                    label,
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    };
+
+    {
+        spsc::SPSCQueue<HeapObjPtr> q(QSIZE);
+        run(q, "HeapStorage  (raw)");
+    }
+    {
+        spsc::SPSCQueue<HeapObjPtr,
+            spsc::SPSCRingBuffer<HeapObjPtr, spsc::InlineStorage<HeapObjPtr, 256>>> q;
+        run(q, "InlineStorage<256> (raw)");
+    }
+    {
+        spsc::SPSCQueue<HeapObjPtr,
+            spsc::SPSCRingBuffer<HeapObjPtr, spsc::VectorStorage<HeapObjPtr>>> q(QSIZE);
+        run(q, "VectorStorage (raw)");
+    }
+    {
+        spsc::SPSCQueue<HeapObjPtr,
+            spsc::SPSCRingBuffer<HeapObjPtr, spsc::ArrayStorage<HeapObjPtr, 256>>> q;
+        run(q, "ArrayStorage<256>  (live, null)");
+    }
+
+    // Clean up pool
+    pool.clear();
+    CHECK(g_heap_obj_live.load() == 0);
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -1002,6 +1278,9 @@ int main() {
     bench_storage_backends();
     test_complex_object_all_backends();
     bench_complex_object();
+    test_shared_ptr_all_backends();
+    test_shared_ptr_queue_destroyed_mid_flight();
+    bench_shared_ptr();
 
     print_summary();
     return g_fail ? 1 : 0;
