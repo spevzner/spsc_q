@@ -122,18 +122,21 @@ public:
     // -----------------------------------------------------------------------
 
     ~SPSCRingBuffer() noexcept {
-        // Destroy elements that were pushed but not yet popped.
-        // Slots outside [tail_, head_) are raw uninitialised memory — do NOT
-        // call destructors on them.
-        if constexpr (!std::is_trivially_destructible_v<T>) {
-            std::size_t       tail = tail_.load(std::memory_order_relaxed);
-            const std::size_t head = head_.load(std::memory_order_relaxed);
-            while (tail != head) {
-                std::destroy_at(storage_.slot(tail & mask_));
-                ++tail;
+        if constexpr (Storage::is_uninitialized) {
+            // Slots outside [tail_, head_) are raw uninitialised bytes — only
+            // destroy elements that were actually pushed but not yet popped.
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                std::size_t       tail = tail_.load(std::memory_order_relaxed);
+                const std::size_t head = head_.load(std::memory_order_relaxed);
+                while (tail != head) {
+                    std::destroy_at(storage_.slot(tail & mask_));
+                    ++tail;
+                }
             }
         }
-        // storage_'s own destructor releases the underlying memory.
+        // For initialised storage (ArrayStorage): all elements are owned by
+        // the storage object's own destructor — nothing extra to do here.
+        // storage_'s destructor runs automatically after this body.
     }
 
     SPSCRingBuffer(const SPSCRingBuffer&)            = delete;
@@ -203,8 +206,15 @@ public:
         T* p = storage_.slot(tail & mask_);
         out  = std::move(*p);
 
-        if constexpr (!std::is_trivially_destructible_v<T>)
-            std::destroy_at(p);
+        if constexpr (Storage::is_uninitialized) {
+            // Raw bytes: explicitly destroy the moved-from object so the slot
+            // reverts to uninitialised storage ready for the next push.
+            if constexpr (!std::is_trivially_destructible_v<T>)
+                std::destroy_at(p);
+        }
+        // Initialised storage (ArrayStorage): leave the slot in its moved-from
+        // state (valid per the standard); the next push will overwrite it via
+        // assignment, and the storage destructor will destroy it eventually.
 
         // Release: the producer's next acquire-load of tail_ will see this,
         // marking the slot as free.
@@ -263,7 +273,15 @@ private:
         if ((head - tail) == capacity_) [[unlikely]]
             return false;  // full — args NOT touched
 
-        std::construct_at(storage_.slot(head & mask_), std::forward<Args>(args)...);
+        if constexpr (Storage::is_uninitialized) {
+            // Raw bytes: construct directly in the slot (zero copies).
+            std::construct_at(storage_.slot(head & mask_), std::forward<Args>(args)...);
+        } else {
+            // Live slot: assign into the already-constructed object.
+            // For try_push(T&&) this is a move-assign; for try_push(const T&)
+            // a copy-assign; for try_emplace a construct-then-move-assign.
+            *storage_.slot(head & mask_) = T(std::forward<Args>(args)...);
+        }
 
         // Release: consumer's next acquire-load of head_ will see the element.
         head_.store(head + 1, std::memory_order_release);
@@ -296,5 +314,6 @@ private:
 static_assert(RingBuffer<SPSCRingBuffer<int>>);
 static_assert(RingBuffer<SPSCRingBuffer<int, InlineStorage<int, 8>>>);
 static_assert(RingBuffer<SPSCRingBuffer<int, VectorStorage<int>>>);
+static_assert(RingBuffer<SPSCRingBuffer<int, ArrayStorage<int, 8>>>);
 
 }  // namespace spsc

@@ -26,15 +26,23 @@
  * Built-in policies
  * =================
  *
- *  ┌─────────────────────────────┬──────────────────────────────────────────┐
- *  │ Type                        │ Best for                                 │
- *  ├─────────────────────────────┼──────────────────────────────────────────┤
- *  │ HeapStorage<T>   (default)  │ General purpose; cache-line aligned heap │
- *  │ InlineStorage<T, N>         │ Hot paths; zero heap, fully on-stack or  │
- *  │                             │ embedded in the queue object itself      │
- *  │ VectorStorage<T>            │ Convenience; portable, no alignment      │
- *  │                             │ guarantee beyond std::vector's           │
- *  └─────────────────────────────┴──────────────────────────────────────────┘
+ *  ┌──────────────────────────────┬────────┬──────────────────────────────────┐
+ *  │ Type                         │ Init?  │ Best for                         │
+ *  ├──────────────────────────────┼────────┼──────────────────────────────────┤
+ *  │ HeapStorage<T>   (default)   │ raw    │ General; cache-line aligned heap │
+ *  │ InlineStorage<T, N>          │ raw    │ Hot paths; zero heap, inline     │
+ *  │ VectorStorage<T>             │ raw    │ Convenience; portable vector     │
+ *  │ ArrayStorage<T, N>           │ live   │ Simple; std::array<T,N> backend; │
+ *  │                              │        │ push=assign, no placement new    │
+ *  └──────────────────────────────┴────────┴──────────────────────────────────┘
+ *
+ * "Init?" column
+ * ==============
+ * raw  — slots are uninitialised bytes; the ring buffer uses placement new on
+ *         push and calls the destructor on pop (is_uninitialized = true).
+ * live — slots hold default-constructed T objects from the start; the ring
+ *         buffer uses assignment on push and skips destroy_at on pop
+ *         (is_uninitialized = false).
  */
 
 #pragma once
@@ -63,18 +71,24 @@ namespace spsc {
  * @tparam S  Candidate storage type.
  *
  * Contract:
- *  - `slot(i)` returns a pointer to uninitialised (or already-constructed)
- *    storage for element `i`.  The index is raw (no modulo applied) — the
- *    ring buffer is responsible for masking it.
- *  - `capacity()` returns the number of available slots (not the byte size).
- *  - The storage object owns its memory; its destructor releases it.
+ *  - `slot(i)` returns a pointer to the element slot at index `i`.
+ *    The index is raw (no modulo) — the ring buffer applies masking.
+ *  - `capacity()` returns the number of slots (not bytes).
+ *  - `is_uninitialized` (static constexpr bool) tells the ring buffer how to
+ *    manage element lifetimes:
+ *      true  — slots are raw uninitialised bytes; ring buffer uses placement
+ *              new on push and calls the destructor on pop / queue destruction.
+ *      false — slots hold live, default-constructed objects; ring buffer uses
+ *              assignment on push and skips destroy_at (the storage destructor
+ *              handles all element lifetimes).
  */
 template <typename S>
 concept StoragePolicy =
     requires { typename S::value_type; } &&
     requires(S& s, const S& cs, std::size_t i) {
-        { s.slot(i)     } -> std::same_as<typename S::value_type*>;
-        { cs.capacity() } -> std::convertible_to<std::size_t>;
+        { s.slot(i)         } -> std::same_as<typename S::value_type*>;
+        { cs.capacity()     } -> std::convertible_to<std::size_t>;
+        { S::is_uninitialized } -> std::convertible_to<bool>;
     };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +130,9 @@ public:
     HeapStorage& operator=(const HeapStorage&) = delete;
     HeapStorage(HeapStorage&&)                 = delete;
     HeapStorage& operator=(HeapStorage&&)      = delete;
+
+    /// Slots are raw uninitialised bytes — ring buffer uses placement new.
+    static constexpr bool is_uninitialized = true;
 
     /** @brief Pointer to the raw slot at index @p i (no bounds checking). */
     [[nodiscard]] T* slot(std::size_t i) noexcept {
@@ -172,6 +189,9 @@ class InlineStorage {
 public:
     using value_type = T;
 
+    /// Slots are raw uninitialised bytes — ring buffer uses placement new.
+    static constexpr bool is_uninitialized = true;
+
     /// Default-construct; capacity is always N.
     InlineStorage() noexcept = default;
 
@@ -224,6 +244,9 @@ class VectorStorage {
 public:
     using value_type = T;
 
+    /// Slots are raw uninitialised bytes — ring buffer uses placement new.
+    static constexpr bool is_uninitialized = true;
+
     explicit VectorStorage(std::size_t n)
         : bytes_(n * sizeof(T))
     {
@@ -245,5 +268,69 @@ private:
 };
 
 static_assert(StoragePolicy<VectorStorage<int>>);
+
+// ---------------------------------------------------------------------------
+// ArrayStorage<T, N>  — std::array<T, N> backend  (slots are live objects)
+// ---------------------------------------------------------------------------
+
+/**
+ * @class ArrayStorage<T, N>
+ * @brief Compile-time-sized storage backed by a plain `std::array<T, N>`.
+ *
+ * Unlike the other storage policies, slots hold **fully constructed** T
+ * objects from the moment the storage is created (default-initialised by
+ * `std::array`).  The ring buffer therefore uses *assignment* on push and
+ * skips `destroy_at` on pop — the array's own destructor handles the full
+ * element lifetime.
+ *
+ * Trade-offs vs InlineStorage
+ * ---------------------------
+ *  + Simpler element access: no `reinterpret_cast` or `std::launder`.
+ *  + Works naturally with any default-constructible T.
+ *  − All N elements are default-constructed up front (one-time cost).
+ *  − Push calls `operator=` rather than a constructor; for non-trivial T
+ *    this means one extra move compared to placement new.
+ *  − `T` must be default-constructible (required by `std::array`).
+ *
+ * @tparam T  Element type — must be default-constructible.
+ * @tparam N  Compile-time slot count (power of 2).
+ */
+template <typename T, std::size_t N>
+class ArrayStorage {
+    static_assert(std::is_default_constructible_v<T>,
+        "ArrayStorage<T, N>: T must be default-constructible");
+    static_assert(N > 0,
+        "ArrayStorage<T, N>: N must be > 0");
+    static_assert((N & (N - 1)) == 0,
+        "ArrayStorage<T, N>: N must be a power of 2");
+
+public:
+    using value_type = T;
+
+    /// Slots are already-constructed live objects — ring buffer uses assignment.
+    static constexpr bool is_uninitialized = false;
+
+    /// Default-construct; all N elements are value-initialised by std::array.
+    ArrayStorage() = default;
+
+    /// Construct from a runtime size; must equal N (debug assertion).
+    explicit ArrayStorage(std::size_t n) noexcept {
+        assert(n == N && "ArrayStorage: requested capacity must equal compile-time N");
+        (void)n;
+    }
+
+    /** @brief Pointer to the live element at index @p i. */
+    [[nodiscard]] T* slot(std::size_t i) noexcept {
+        return arr_.data() + i;
+    }
+
+    /** @brief Always returns N. */
+    [[nodiscard]] constexpr std::size_t capacity() const noexcept { return N; }
+
+private:
+    std::array<T, N> arr_{};
+};
+
+static_assert(StoragePolicy<ArrayStorage<int, 8>>);
 
 }  // namespace spsc

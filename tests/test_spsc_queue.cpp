@@ -456,12 +456,14 @@ static void test_storage_concepts() {
 
     // Aliases avoid the preprocessor treating template commas as macro arg
     // separators (the static_asserts in storage.hpp fire at compile time too).
-    using HeapInt     = spsc::HeapStorage<int>;
-    using HeapStr     = spsc::HeapStorage<std::string>;
-    using InlineInt8  = spsc::InlineStorage<int, 8>;
-    using InlineStr16 = spsc::InlineStorage<std::string, 16>;
-    using VecInt      = spsc::VectorStorage<int>;
-    using VecStr      = spsc::VectorStorage<std::string>;
+    using HeapInt      = spsc::HeapStorage<int>;
+    using HeapStr      = spsc::HeapStorage<std::string>;
+    using InlineInt8   = spsc::InlineStorage<int, 8>;
+    using InlineStr16  = spsc::InlineStorage<std::string, 16>;
+    using VecInt       = spsc::VectorStorage<int>;
+    using VecStr       = spsc::VectorStorage<std::string>;
+    using ArrayInt8    = spsc::ArrayStorage<int, 8>;
+    using ArrayStr8    = spsc::ArrayStorage<std::string, 8>;
 
     CHECK(spsc::StoragePolicy<HeapInt>);
     CHECK(spsc::StoragePolicy<HeapStr>);
@@ -469,6 +471,20 @@ static void test_storage_concepts() {
     CHECK(spsc::StoragePolicy<InlineStr16>);
     CHECK(spsc::StoragePolicy<VecInt>);
     CHECK(spsc::StoragePolicy<VecStr>);
+    CHECK(spsc::StoragePolicy<ArrayInt8>);
+    CHECK(spsc::StoragePolicy<ArrayStr8>);
+
+    // Verify the is_uninitialized trait is set correctly per type.
+    // Use constexpr locals to avoid the preprocessor treating template commas
+    // as macro argument separators.
+    constexpr bool heap_uninit   = spsc::HeapStorage<int>::is_uninitialized;
+    constexpr bool inline_uninit = spsc::InlineStorage<int, 8>::is_uninitialized;
+    constexpr bool vec_uninit    = spsc::VectorStorage<int>::is_uninitialized;
+    constexpr bool array_uninit  = spsc::ArrayStorage<int, 8>::is_uninitialized;
+    CHECK(heap_uninit   == true);
+    CHECK(inline_uninit == true);
+    CHECK(vec_uninit    == true);
+    CHECK(array_uninit  == false);
 }
 
 // ---------------------------------------------------------------------------
@@ -585,12 +601,71 @@ static void test_vector_storage() {
 }
 
 // ---------------------------------------------------------------------------
+// ArrayStorage — std::array<T, N> backend (slots are live objects)
+// ---------------------------------------------------------------------------
+static void test_array_storage() {
+    section("ArrayStorage<T, N> — std::array backend");
+
+    // Default-construct (no capacity arg); capacity == N.
+    spsc::SPSCRingBuffer<int, spsc::ArrayStorage<int, 8>> rb;
+    CHECK(rb.capacity() == 8);
+    CHECK(rb.empty());
+
+    for (int i = 0; i < 8; ++i) CHECK(rb.try_push(i));
+    CHECK(rb.full());
+    CHECK(!rb.try_push(99));
+
+    int v{};
+    for (int i = 0; i < 8; ++i) {
+        CHECK(rb.try_pop(v));
+        CHECK(v == i);
+    }
+    CHECK(rb.empty());
+
+    // Non-trivial element type: std::string
+    spsc::SPSCRingBuffer<std::string, spsc::ArrayStorage<std::string, 4>> srb;
+    CHECK(srb.capacity() == 4);
+
+    CHECK(srb.try_push(std::string("one")));
+    CHECK(srb.try_push(std::string("two")));
+    CHECK(srb.try_push(std::string("three")));
+    CHECK(srb.try_push(std::string("four")));
+    CHECK(srb.full());
+
+    std::string s;
+    CHECK(srb.try_pop(s)); CHECK(s == "one");
+    CHECK(srb.try_pop(s)); CHECK(s == "two");
+    CHECK(srb.try_pop(s)); CHECK(s == "three");
+    CHECK(srb.try_pop(s)); CHECK(s == "four");
+    CHECK(srb.empty());
+
+    // FIFO ordering over many elements (exercises index wraparound).
+    spsc::SPSCRingBuffer<int, spsc::ArrayStorage<int, 16>> rb2;
+    for (int round = 0; round < 500; ++round) {
+        for (int i = 0; i < 16; ++i) CHECK(rb2.try_push(round * 16 + i));
+        for (int i = 0; i < 16; ++i) {
+            CHECK(rb2.try_pop(v));
+            CHECK(v == round * 16 + i);
+        }
+    }
+
+    // Via SPSCQueue default constructor.
+    spsc::SPSCQueue<int,
+        spsc::SPSCRingBuffer<int, spsc::ArrayStorage<int, 32>>> q;
+    CHECK(q.capacity() == 32);
+    q.push(7);
+    int out{};
+    q.pop(out);
+    CHECK(out == 7);
+}
+
+// ---------------------------------------------------------------------------
 // Throughput comparison across storage backends
 // ---------------------------------------------------------------------------
 static void bench_storage_backends() {
     section("Throughput comparison — storage backends");
 
-    constexpr std::size_t N     = 5'000'000;
+    constexpr std::size_t N     = 10'000'000;
     constexpr std::size_t QSIZE = 512;
 
     auto run = [&](auto& q, const char* label) {
@@ -632,7 +707,13 @@ static void bench_storage_backends() {
         // InlineStorage: capacity is compile-time, use default constructor
         spsc::SPSCQueue<std::uint64_t,
             spsc::SPSCRingBuffer<std::uint64_t, spsc::InlineStorage<std::uint64_t, 512>>> q;
-        run(q, "InlineStorage<512> (zero-heap)");
+        run(q, "InlineStorage<512> (zero-heap, raw)");
+    }
+    {
+        // ArrayStorage: live std::array slots, push via assignment
+        spsc::SPSCQueue<std::uint64_t,
+            spsc::SPSCRingBuffer<std::uint64_t, spsc::ArrayStorage<std::uint64_t, 512>>> q;
+        run(q, "ArrayStorage<512>  (zero-heap, live)");
     }
 }
 
@@ -661,6 +742,7 @@ int main() {
     test_inline_storage();
     test_inline_storage_stack_resident();
     test_vector_storage();
+    test_array_storage();
     bench_storage_backends();
 
     print_summary();
