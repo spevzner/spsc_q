@@ -6,14 +6,17 @@
  * Usage
  * =====
  *
- *   // Default: SPSCRingBuffer<int> under the hood
+ *   // Default: SPSCRingBuffer<int, HeapStorage<int>> — runtime capacity
  *   spsc::SPSCQueue<int> q(1024);
- *   q.push(42);
- *   int v;
- *   q.pop(v);  // v == 42
  *
- *   // Custom ring buffer:
- *   spsc::SPSCQueue<MyEvent, MyCustomRingBuffer<MyEvent>> q2(512);
+ *   // Zero-heap inline storage — default-construct, capacity is compile-time N
+ *   spsc::SPSCQueue<int, spsc::SPSCRingBuffer<int, spsc::InlineStorage<int, 64>>> q2;
+ *
+ *   // std::vector storage backend
+ *   spsc::SPSCQueue<int, spsc::SPSCRingBuffer<int, spsc::VectorStorage<int>>> q3(512);
+ *
+ *   // Custom ring buffer (anything satisfying RingBuffer<>)
+ *   spsc::SPSCQueue<MyEvent, MyRingBuffer<MyEvent>> q4(512);
  *
  * Blocking vs non-blocking
  * ========================
@@ -57,13 +60,28 @@ public:
     // -----------------------------------------------------------------------
 
     /**
-     * @brief Construct a queue whose ring buffer has at least @p capacity slots.
+     * @brief Construct with a runtime capacity (forwarded to the ring buffer).
      *
-     * The ring buffer implementation may round the value up (e.g.
-     * `SPSCRingBuffer` rounds to the next power of 2).  Query `capacity()` to
-     * learn the actual allocated size.
+     * The ring buffer may round the value up (SPSCRingBuffer uses power-of-2).
+     * Query `capacity()` to learn the actual allocated size.
+     *
+     * Available when the underlying ring buffer accepts a `std::size_t`.
      */
-    explicit SPSCQueue(std::size_t capacity) : rb_(capacity) {}
+    explicit SPSCQueue(std::size_t capacity)
+        requires std::constructible_from<RB, std::size_t>
+        : rb_(capacity) {}
+
+    /**
+     * @brief Default-construct using the ring buffer's default constructor.
+     *
+     * Available when the ring buffer is default-constructible, e.g. when it
+     * wraps an `InlineStorage<T, N>` whose capacity is a compile-time constant.
+     *
+     *   SPSCQueue<int, SPSCRingBuffer<int, InlineStorage<int, 64>>> q;
+     */
+    SPSCQueue()
+        requires std::default_initializable<RB>
+        : rb_() {}
 
     ~SPSCQueue()                             = default;
     SPSCQueue(const SPSCQueue&)              = delete;

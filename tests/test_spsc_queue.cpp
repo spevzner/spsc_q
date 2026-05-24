@@ -12,6 +12,7 @@
 #include "spsc_queue.hpp"
 #include "spsc_ring_buffer.hpp"
 #include "ring_buffer.hpp"
+#include "storage.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -444,6 +445,198 @@ static void test_custom_ring_buffer() {
 }
 
 // ===========================================================================
+// Storage policy tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// StoragePolicy concept satisfaction
+// ---------------------------------------------------------------------------
+static void test_storage_concepts() {
+    section("StoragePolicy concept satisfaction (compile-time)");
+
+    // Aliases avoid the preprocessor treating template commas as macro arg
+    // separators (the static_asserts in storage.hpp fire at compile time too).
+    using HeapInt     = spsc::HeapStorage<int>;
+    using HeapStr     = spsc::HeapStorage<std::string>;
+    using InlineInt8  = spsc::InlineStorage<int, 8>;
+    using InlineStr16 = spsc::InlineStorage<std::string, 16>;
+    using VecInt      = spsc::VectorStorage<int>;
+    using VecStr      = spsc::VectorStorage<std::string>;
+
+    CHECK(spsc::StoragePolicy<HeapInt>);
+    CHECK(spsc::StoragePolicy<HeapStr>);
+    CHECK(spsc::StoragePolicy<InlineInt8>);
+    CHECK(spsc::StoragePolicy<InlineStr16>);
+    CHECK(spsc::StoragePolicy<VecInt>);
+    CHECK(spsc::StoragePolicy<VecStr>);
+}
+
+// ---------------------------------------------------------------------------
+// HeapStorage — explicit use
+// ---------------------------------------------------------------------------
+static void test_heap_storage() {
+    section("HeapStorage<T> — explicit backend");
+
+    spsc::SPSCRingBuffer<int, spsc::HeapStorage<int>> rb(7);
+    // 7 rounds up to 8
+    CHECK(rb.capacity() == 8);
+    CHECK(rb.empty());
+
+    for (int i = 0; i < 8; ++i) CHECK(rb.try_push(i));
+    CHECK(rb.full());
+    CHECK(!rb.try_push(99));
+
+    int v{};
+    for (int i = 0; i < 8; ++i) {
+        CHECK(rb.try_pop(v));
+        CHECK(v == i);
+    }
+    CHECK(rb.empty());
+}
+
+// ---------------------------------------------------------------------------
+// InlineStorage — zero-heap, compile-time N
+// ---------------------------------------------------------------------------
+static void test_inline_storage() {
+    section("InlineStorage<T, N> — zero-heap backend");
+
+    // Default-construct (no capacity argument needed)
+    spsc::SPSCRingBuffer<int, spsc::InlineStorage<int, 16>> rb;
+    CHECK(rb.capacity() == 16);
+    CHECK(rb.empty());
+
+    for (int i = 0; i < 16; ++i) CHECK(rb.try_push(i));
+    CHECK(rb.full());
+    CHECK(!rb.try_push(99));
+
+    int v{};
+    for (int i = 0; i < 16; ++i) {
+        CHECK(rb.try_pop(v));
+        CHECK(v == i);
+    }
+    CHECK(rb.empty());
+
+    // Also verify via SPSCQueue default constructor
+    spsc::SPSCQueue<int, spsc::SPSCRingBuffer<int, spsc::InlineStorage<int, 8>>> q;
+    CHECK(q.capacity() == 8);
+    q.push(42);
+    int out{};
+    q.pop(out);
+    CHECK(out == 42);
+}
+
+// ---------------------------------------------------------------------------
+// InlineStorage — object lives entirely on the stack (no heap)
+// ---------------------------------------------------------------------------
+static void test_inline_storage_stack_resident() {
+    section("InlineStorage<T, N> — verifying no heap allocation");
+
+    // This test is inherently hard to verify portably. We simply confirm
+    // that construction and push/pop work for a non-trivial element type,
+    // exercising placement-new and destroy_at on inline storage.
+
+    using Q = spsc::SPSCRingBuffer<std::string, spsc::InlineStorage<std::string, 4>>;
+    Q rb;
+    CHECK(rb.capacity() == 4);
+
+    CHECK(rb.try_push(std::string("alpha")));
+    CHECK(rb.try_push(std::string("beta")));
+    CHECK(rb.try_push(std::string("gamma")));
+    CHECK(rb.try_push(std::string("delta")));
+    CHECK(rb.full());
+
+    std::string s;
+    CHECK(rb.try_pop(s)); CHECK(s == "alpha");
+    CHECK(rb.try_pop(s)); CHECK(s == "beta");
+    CHECK(rb.try_pop(s)); CHECK(s == "gamma");
+    CHECK(rb.try_pop(s)); CHECK(s == "delta");
+    CHECK(rb.empty());
+}
+
+// ---------------------------------------------------------------------------
+// VectorStorage — std::vector<byte> backend
+// ---------------------------------------------------------------------------
+static void test_vector_storage() {
+    section("VectorStorage<T> — std::vector backend");
+
+    spsc::SPSCRingBuffer<int, spsc::VectorStorage<int>> rb(5);
+    // VectorStorage doesn't round to power-of-2 itself;
+    // SPSCRingBuffer does, so capacity is 8.
+    CHECK(rb.capacity() == 8);
+
+    for (int i = 0; i < 8; ++i) CHECK(rb.try_push(i));
+    CHECK(rb.full());
+
+    int v{};
+    for (int i = 0; i < 8; ++i) {
+        CHECK(rb.try_pop(v));
+        CHECK(v == i);
+    }
+    CHECK(rb.empty());
+
+    // Non-trivial type
+    spsc::SPSCRingBuffer<std::string, spsc::VectorStorage<std::string>> srb(4);
+    CHECK(srb.capacity() == 4);
+    CHECK(srb.try_push(std::string("hello")));
+    CHECK(srb.try_push(std::string("world")));
+    std::string s;
+    CHECK(srb.try_pop(s)); CHECK(s == "hello");
+    CHECK(srb.try_pop(s)); CHECK(s == "world");
+}
+
+// ---------------------------------------------------------------------------
+// Throughput comparison across storage backends
+// ---------------------------------------------------------------------------
+static void bench_storage_backends() {
+    section("Throughput comparison — storage backends");
+
+    constexpr std::size_t N     = 5'000'000;
+    constexpr std::size_t QSIZE = 512;
+
+    auto run = [&](auto& q, const char* label) {
+        std::atomic<bool> go{false};
+        double ms = elapsed_ms([&] {
+            std::thread prod([&] {
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(static_cast<std::uint64_t>(i));
+            });
+            std::thread cons([&] {
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                std::uint64_t v{};
+                for (std::size_t i = 0; i < N; ++i)
+                    q.pop(v);
+            });
+            go.store(true, std::memory_order_release);
+            prod.join();
+            cons.join();
+        });
+        std::printf("     %-35s  %.1f M ops/s  (%.2f ns/op)\n",
+                    label,
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    };
+
+    {
+        spsc::SPSCQueue<std::uint64_t> q(QSIZE);  // HeapStorage (default)
+        run(q, "HeapStorage (default)");
+    }
+    {
+        spsc::SPSCQueue<std::uint64_t,
+            spsc::SPSCRingBuffer<std::uint64_t, spsc::VectorStorage<std::uint64_t>>> q(QSIZE);
+        run(q, "VectorStorage");
+    }
+    {
+        // InlineStorage: capacity is compile-time, use default constructor
+        spsc::SPSCQueue<std::uint64_t,
+            spsc::SPSCRingBuffer<std::uint64_t, spsc::InlineStorage<std::uint64_t, 512>>> q;
+        run(q, "InlineStorage<512> (zero-heap)");
+    }
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -463,6 +656,12 @@ int main() {
     test_spin_push_pop_threaded();
     bench_throughput();
     test_custom_ring_buffer();
+    test_storage_concepts();
+    test_heap_storage();
+    test_inline_storage();
+    test_inline_storage_stack_resident();
+    test_vector_storage();
+    bench_storage_backends();
 
     print_summary();
     return g_fail ? 1 : 0;
