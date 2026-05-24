@@ -1250,6 +1250,265 @@ static void bench_shared_ptr()
 }
 
 // ===========================================================================
+// Raw pointer queue tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Correctness: two ownership patterns
+//
+//  Pattern A — shared_ptr pool (producer retains ownership, consumer borrows)
+//    shared_ptr keeps objects alive; the queue carries only the raw address.
+//    Consumer reads but does NOT delete.
+//
+//  Pattern B — new/delete transfer (consumer owns and deletes)
+//    Producer does `new`, pushes raw ptr; consumer does `delete`.
+//    Ownership passes through the queue.
+// ---------------------------------------------------------------------------
+static void test_raw_pointer_queue()
+{
+    section("Raw pointer (Message*) — shared_ptr pool + new/delete patterns");
+
+    constexpr int N = 32;
+
+    // ── Pattern A: shared_ptr pool, consumer borrows ───────────────────────
+    {
+        std::printf("   [Pattern A: shared_ptr pool — consumer borrows raw ptr]\n");
+
+        // Producer builds a pool; shared_ptrs hold the objects alive.
+        std::vector<std::shared_ptr<Message>> pool;
+        pool.reserve(N);
+        for (int i = 0; i < N; ++i)
+            pool.push_back(std::make_shared<Message>(
+                static_cast<std::uint64_t>(i),
+                "pool_" + std::to_string(i),
+                i * 1.5));
+
+        CHECK(g_msg_live.load() == N);
+
+        spsc::SPSCQueue<Message*> q(N);
+
+        // Enqueue raw pointers extracted from the pool.
+        for (auto& sp : pool)
+            CHECK(q.try_push(sp.get()));
+
+        CHECK(q.full());
+
+        // Consumer: borrow, inspect, never delete.
+        for (int i = 0; i < N; ++i) {
+            Message* ptr = nullptr;
+            CHECK(q.try_pop(ptr));
+            CHECK(ptr != nullptr);
+            CHECK(ptr->id    == static_cast<std::uint64_t>(i));
+            CHECK(ptr->value == i * 1.5);
+            CHECK(!ptr->text.empty());
+        }
+
+        CHECK(q.empty());
+        CHECK(g_msg_live.load() == N);   // pool still owns — nothing destroyed
+
+        pool.clear();
+        CHECK(g_msg_live.load() == 0);   // pool gone — all destroyed
+    }
+
+    // ── Pattern B: new/delete, consumer owns ──────────────────────────────
+    {
+        std::printf("   [Pattern B: new/delete — consumer deletes]\n");
+
+        spsc::SPSCQueue<Message*> q(N);
+
+        // Producer allocates with `new`, pushes raw ptr.
+        for (int i = 0; i < N; ++i) {
+            Message* p = new Message(
+                static_cast<std::uint64_t>(i),
+                "heap_" + std::to_string(i),
+                i * 2.71828);
+            CHECK(q.try_push(p));
+        }
+
+        CHECK(g_msg_live.load() == N);
+
+        // Consumer pops and deletes; object destroyed immediately.
+        for (int i = 0; i < N; ++i) {
+            Message* ptr = nullptr;
+            CHECK(q.try_pop(ptr));
+            CHECK(ptr != nullptr);
+            CHECK(ptr->id    == static_cast<std::uint64_t>(i));
+            CHECK(ptr->value == i * 2.71828);
+            delete ptr;
+            CHECK(g_msg_live.load() == N - i - 1);
+        }
+
+        CHECK(g_msg_live.load() == 0);
+    }
+
+    // ── All four storage backends with raw pointer ─────────────────────────
+    {
+        std::printf("   [All backends: Message* is trivially copyable — no ctor/dtor in queue]\n");
+
+        auto test_backend = [&](auto& rb, const char* label) {
+            for (int i = 0; i < 8; ++i)
+                CHECK(rb.try_push(new Message(i, "x", i * 1.0)));
+            CHECK(g_msg_live.load() == 8);
+            Message* p = nullptr;
+            for (int i = 0; i < 8; ++i) {
+                CHECK(rb.try_pop(p));
+                CHECK(p->id == static_cast<std::uint64_t>(i));
+                delete p;
+            }
+            CHECK(g_msg_live.load() == 0);
+            std::printf("     %-35s  OK\n", label);
+        };
+
+        {
+            spsc::SPSCRingBuffer<Message*> rb(8);
+            test_backend(rb, "HeapStorage  (raw)");
+        }
+        {
+            spsc::SPSCRingBuffer<Message*, spsc::InlineStorage<Message*, 8>> rb;
+            test_backend(rb, "InlineStorage<8> (raw)");
+        }
+        {
+            spsc::SPSCRingBuffer<Message*, spsc::VectorStorage<Message*>> rb(8);
+            test_backend(rb, "VectorStorage (raw)");
+        }
+        {
+            spsc::SPSCRingBuffer<Message*, spsc::ArrayStorage<Message*, 8>> rb;
+            test_backend(rb, "ArrayStorage<8>  (live)");
+        }
+    }
+
+    CHECK(g_msg_live.load() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Throughput comparison:
+//   Message*               — raw pointer (8 bytes, trivially everything)
+//   shared_ptr<Message>    — smart pointer (~16 bytes + control block)
+//   Message (by value)     — 40+ bytes, non-trivial destructor
+//
+// All use HeapStorage (default) to isolate the element-type cost.
+// ---------------------------------------------------------------------------
+static void bench_raw_vs_smart_vs_value()
+{
+    section("Throughput — Message* vs shared_ptr<Message> vs Message (by value)");
+
+    constexpr std::size_t N     = 4'000'000;
+    constexpr std::size_t QSIZE = 256;
+
+    // Pre-allocate a fixed pool so the hot loop doesn't call new/delete.
+    constexpr std::size_t POOL = QSIZE * 2;
+
+    // ── raw pointer ──────────────────────────────────────────────────────
+    {
+        // Build pool of raw pointers.
+        std::vector<Message*> raw_pool;
+        raw_pool.reserve(POOL);
+        for (std::size_t i = 0; i < POOL; ++i)
+            raw_pool.push_back(new Message(
+                static_cast<std::uint64_t>(i), "p", 0.0));
+
+        spsc::SPSCQueue<Message*> q(QSIZE);
+        std::atomic<bool> go{false};
+
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(raw_pool[i % POOL]);   // copy the pointer (8 bytes)
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                Message* v = nullptr;
+                for (std::size_t i = 0; i < N; ++i)
+                    q.pop(v);                      // receive pointer, don't delete
+            });
+            go.store(true, std::memory_order_release);
+            prod.join();
+            cons.join();
+        });
+
+        std::printf("     %-38s  %.1f M ops/s  (%.1f ns/op)\n",
+                    "Message*  (raw ptr, 8 bytes)",
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+
+        for (auto* p : raw_pool) delete p;
+    }
+
+    // ── shared_ptr<Message> ──────────────────────────────────────────────
+    {
+        std::vector<std::shared_ptr<Message>> sp_pool;
+        sp_pool.reserve(POOL);
+        for (std::size_t i = 0; i < POOL; ++i)
+            sp_pool.push_back(std::make_shared<Message>(
+                static_cast<std::uint64_t>(i), "p", 0.0));
+
+        spsc::SPSCQueue<std::shared_ptr<Message>> q(QSIZE);
+        std::atomic<bool> go{false};
+
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(sp_pool[i % POOL]);     // copy shared_ptr → atomic ref++
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                std::shared_ptr<Message> v;
+                for (std::size_t i = 0; i < N; ++i) {
+                    q.pop(v);                      // receive → atomic ref--
+                    v.reset();
+                }
+            });
+            go.store(true, std::memory_order_release);
+            prod.join();
+            cons.join();
+        });
+
+        std::printf("     %-38s  %.1f M ops/s  (%.1f ns/op)\n",
+                    "shared_ptr<Message>  (atomic ref-cnt)",
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    }
+
+    // ── Message by value (SSO string "p") ────────────────────────────────
+    {
+        spsc::SPSCQueue<Message> q(QSIZE);
+        std::atomic<bool> go{false};
+
+        double ms = elapsed_ms([&]{
+            std::thread prod([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                for (std::size_t i = 0; i < N; ++i)
+                    q.push(Message{i, "p", static_cast<double>(i)});
+            });
+            std::thread cons([&]{
+                while (!go.load(std::memory_order_acquire))
+                    spsc::detail::cpu_relax();
+                Message v;
+                for (std::size_t i = 0; i < N; ++i)
+                    q.pop(v);
+            });
+            go.store(true, std::memory_order_release);
+            prod.join();
+            cons.join();
+        });
+
+        std::printf("     %-38s  %.1f M ops/s  (%.1f ns/op)\n",
+                    "Message by value  (move+dtor, SSO)",
+                    static_cast<double>(N) / (ms * 1e3),
+                    ms * 1e6 / static_cast<double>(N));
+    }
+
+    CHECK(g_msg_live.load() == 0);
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -1281,6 +1540,8 @@ int main() {
     test_shared_ptr_all_backends();
     test_shared_ptr_queue_destroyed_mid_flight();
     bench_shared_ptr();
+    test_raw_pointer_queue();
+    bench_raw_vs_smart_vs_value();
 
     print_summary();
     return g_fail ? 1 : 0;
